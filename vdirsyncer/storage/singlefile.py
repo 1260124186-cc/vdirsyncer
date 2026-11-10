@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import errno
 import functools
 import glob
 import logging
@@ -109,6 +110,16 @@ class SingleFileStorage(Storage):
         kwargs["path"] = path
         kwargs["collection"] = collection
         return kwargs
+
+    async def delete_collection(self):
+        # The caller has verified that the file contains no items.
+        try:
+            os.remove(self.path)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise exceptions.UserError(
+                    f"Could not remove empty collection file {self.path!r}: {e}"
+                )
 
     async def list(self):
         self._items = collections.OrderedDict()

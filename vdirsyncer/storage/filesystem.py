@@ -82,6 +82,21 @@ class FilesystemStorage(Storage):
         kwargs["collection"] = collection
         return kwargs
 
+    async def delete_collection(self):
+        # os.rmdir only removes empty directories, so a collection that
+        # somehow gained items can never be removed here.
+        try:
+            os.rmdir(self.path)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return
+            if e.errno == errno.ENOTEMPTY:
+                raise exceptions.UserError(
+                    f"Refusing to remove non-empty collection directory "
+                    f"{self.path!r}."
+                )
+            raise
+
     def _get_filepath(self, href):
         return os.path.join(self.path, href)
 

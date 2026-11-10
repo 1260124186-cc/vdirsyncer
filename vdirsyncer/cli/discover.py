@@ -11,6 +11,7 @@ import aiostream
 
 from vdirsyncer import exceptions
 
+from .create_collection import CollectionCreationCoordinator
 from .utils import handle_collection_not_found
 from .utils import handle_storage_init_error
 from .utils import load_status
@@ -100,6 +101,13 @@ async def collections_for_pair(
             config, collection, e=e, implicit_create=pair.implicit == "create"
         )
 
+    creation_coordinator = CollectionCreationCoordinator(
+        status_path=status_path,
+        pair=pair,
+        connector=connector,
+        handle_collection_not_found=_handle_collection_not_found,
+    )
+
     # We have to use a list here because the special None/null value would get
     # mangled to string (because JSON objects always have string keys).
     rv = await aiostream.stream.list(  #  type: ignore[assignment]
@@ -110,6 +118,7 @@ async def collections_for_pair(
             get_a_discovered=a_discovered.get_self,
             get_b_discovered=b_discovered.get_self,
             _handle_collection_not_found=_handle_collection_not_found,
+            ensure_collection=creation_coordinator.ensure_collection,
         )
     )
 
@@ -207,6 +216,7 @@ async def expand_collections(
     get_a_discovered,
     get_b_discovered,
     _handle_collection_not_found,
+    ensure_collection=None,
 ):
     handled_collections = set()
 
@@ -231,18 +241,27 @@ async def expand_collections(
                 continue
             handled_collections.add(collection)
 
-            a_args = await _collection_from_discovered(
-                get_a_discovered,
-                collection_a,
-                config_a,
-                _handle_collection_not_found,
-            )
-            b_args = await _collection_from_discovered(
-                get_b_discovered,
-                collection_b,
-                config_b,
-                _handle_collection_not_found,
-            )
+            if ensure_collection is not None and collection is not None:
+                a_args, b_args = await ensure_collection(
+                    collection,
+                    collection_a,
+                    collection_b,
+                    get_a_discovered,
+                    get_b_discovered,
+                )
+            else:
+                a_args = await _collection_from_discovered(
+                    get_a_discovered,
+                    collection_a,
+                    config_a,
+                    _handle_collection_not_found,
+                )
+                b_args = await _collection_from_discovered(
+                    get_b_discovered,
+                    collection_b,
+                    config_b,
+                    _handle_collection_not_found,
+                )
 
             yield collection, (a_args, b_args)
 

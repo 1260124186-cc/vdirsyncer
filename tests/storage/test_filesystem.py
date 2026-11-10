@@ -130,3 +130,35 @@ class TestFilesystemStorage(StorageTests):
             c["collection"] async for c in self.storage_class.discover(str(tmpdir))
         }
         assert actual == expected
+
+    @pytest.mark.asyncio
+    async def test_delete_empty_collection(self, tmpdir):
+        args = await self.storage_class.create_collection(
+            collection="c", path=str(tmpdir), fileext=".txt"
+        )
+        storage = self.storage_class(**args)
+        await storage.delete_collection()
+        assert not tmpdir.join("c").check()
+
+    @pytest.mark.asyncio
+    async def test_delete_collection_is_idempotent_when_missing(self, tmpdir):
+        args = await self.storage_class.create_collection(
+            collection="c", path=str(tmpdir), fileext=".txt"
+        )
+        storage = self.storage_class(**args)
+        tmpdir.join("c").remove()
+        # Must not raise even though the directory is already gone.
+        await storage.delete_collection()
+
+    @pytest.mark.asyncio
+    async def test_delete_collection_refuses_nonempty(self, tmpdir):
+        from vdirsyncer import exceptions
+
+        args = await self.storage_class.create_collection(
+            collection="c", path=str(tmpdir), fileext=".txt"
+        )
+        tmpdir.join("c").join("item.txt").write("data")
+        storage = self.storage_class(**args)
+        with pytest.raises(exceptions.UserError):
+            await storage.delete_collection()
+        assert tmpdir.join("c", "item.txt").check(file=True)

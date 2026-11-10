@@ -133,6 +133,17 @@ class Storage(metaclass=StorageMeta):
         """
         raise NotImplementedError
 
+    async def delete_collection(self):
+        """Delete an empty collection that vdirsyncer created itself.
+
+        This is used to roll back a failed, partially completed collection
+        creation. Implementations must only remove the collection itself; the
+        caller is responsible for making sure it contains no items. Storages
+        that cannot safely remove a collection leave this unimplemented, in
+        which case the user is asked to clean up manually.
+        """
+        raise NotImplementedError
+
     def __repr__(self):
         try:
             if self.instance_name:
