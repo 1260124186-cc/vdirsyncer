@@ -125,31 +125,65 @@ def sync(ctx, collections, force_delete):
     # Sync only "first_collection" from the pair "bob"
     vdirsyncer sync bob/first_collection
     """
+    from .runrecord import SyncRun
+    from .runrecord import make_plan_entry
     from .tasks import prepare_pair
     from .tasks import sync_collection
+    from .utils import get_status_name
 
     async def main(collection_names):
         async with aiohttp.TCPConnector(limit_per_host=16) as conn:
-            tasks = []
+            # Discover the complete collection plan before synchronizing
+            # anything, so the plan can be checkpointed and an interrupted
+            # run resumed without redoing successful collections.
+            plan = []
             for pair_name, pair_collections in collection_names:
-                async for collection, config in prepare_pair(
+                async for collection, general in prepare_pair(
                     pair_name=pair_name,
                     collections=pair_collections,
                     config=ctx.config,
                     connector=conn,
                 ):
-                    tasks.append(
-                        sync_collection(
-                            collection=collection,
-                            general=config,
-                            force_delete=force_delete,
-                            connector=conn,
-                        )
+                    plan.append((collection, general))
+
+            run = None
+            if plan:
+                entries = [make_plan_entry(collection) for collection, _ in plan]
+                run = SyncRun.open(ctx.config.general["status_path"], entries)
+
+            async def run_one(collection, general):
+                status_name = get_status_name(collection.pair.name, collection.name)
+                try:
+                    await sync_collection(
+                        collection=collection,
+                        general=general,
+                        force_delete=force_delete,
+                        connector=conn,
                     )
+                except Exception:
+                    run.mark_result(status_name, False)
+                    raise
+                else:
+                    run.mark_result(status_name, True)
+
+            tasks = []
+            for collection, general in plan:
+                status_name = get_status_name(collection.pair.name, collection.name)
+                if run is not None and not run.should_sync(status_name):
+                    cli_logger.info(
+                        f"Skipping {status_name}: already synchronized in an "
+                        "earlier run."
+                    )
+                    continue
+                tasks.append(run_one(collection, general))
 
             # `return_exceptions=True` ensures that the event loop lives long enough for
             # backoffs to be able to finish
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            if run is not None:
+                # Every task has settled (success or failure); converge the
+                # run record while keeping the failure in the exit status.
+                run.finish()
             # but now we need to manually check for and propogate a single failure after
             # allowing all tasks to finish in order to keep exit status non-zero
             failures = [e for e in gathered if isinstance(e, BaseException)]

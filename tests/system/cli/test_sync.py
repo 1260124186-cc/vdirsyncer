@@ -577,3 +577,307 @@ def test_fetch_only_necessary_params(tmpdir, runner):
     r = runner.invoke(["sync", "bambar"])
     assert not r.exception
     assert fetched()
+
+
+def _write_multi_collection_config(
+    runner, tmpdir, *, bar_path="bar", collections=("a", "b", "c")
+):
+    runner.write_with_general(
+        dedent(
+            """
+    [storage foo]
+    type = "filesystem"
+    path = "{base}/foo/"
+    fileext = ".txt"
+
+    [storage bar]
+    type = "filesystem"
+    path = "{base}/{bar_path}/"
+    fileext = ".txt"
+
+    [pair foobar]
+    a = "foo"
+    b = "bar"
+    collections = {collections}
+    """
+        ).format(
+            base=str(tmpdir),
+            bar_path=bar_path,
+            collections=json.dumps(list(collections)),
+        )
+    )
+
+
+def _make_collection_dirs(tmpdir, bases, names):
+    for base in bases:
+        base_dir = tmpdir.mkdir(base)
+        for name in names:
+            base_dir.mkdir(name)
+
+
+def _run_record_path(tmpdir):
+    return tmpdir.join("status").join(".sync_run.json")
+
+
+def _load_run_record(tmpdir):
+    return json.loads(_run_record_path(tmpdir).read())
+
+
+def _record_results(tmpdir):
+    return {
+        entry["collection"]: entry["result"]
+        for entry in _load_run_record(tmpdir)["collections"]
+    }
+
+
+def _patch_interrupted_run(monkeypatch, failing_collection="b"):
+    """Make one collection fail and pretend the process was interrupted
+    before the run could converge to ``complete``."""
+    from vdirsyncer.cli import tasks
+    from vdirsyncer.cli.runrecord import SyncRun
+    from vdirsyncer.cli.utils import JobFailed
+
+    real_sync_collection = tasks.sync_collection
+
+    async def broken_sync_collection(collection, general, force_delete, *, connector):
+        if collection.name == failing_collection:
+            raise JobFailed("simulated failure")
+        return await real_sync_collection(
+            collection, general, force_delete, connector=connector
+        )
+
+    monkeypatch.setattr(tasks, "sync_collection", broken_sync_collection)
+    monkeypatch.setattr(SyncRun, "finish", lambda self: None)
+
+
+def test_sync_run_resume_skips_successful_collections(tmpdir, runner, monkeypatch):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    _patch_interrupted_run(monkeypatch)
+    result = runner.invoke(["sync"])
+    assert result.exception
+
+    record = _load_run_record(tmpdir)
+    assert record["state"] == "running"
+    assert _record_results(tmpdir) == {
+        "a": "success",
+        "b": "failed",
+        "c": "success",
+    }
+
+    monkeypatch.undo()
+    result = runner.invoke(["sync"])
+    assert not result.exception, result.output
+
+    # Only the failed collection is retried; earlier successes are skipped.
+    assert "Syncing foobar/b" in result.output
+    assert "Syncing foobar/a" not in result.output
+    assert "Syncing foobar/c" not in result.output
+    assert "Skipping foobar/a" in result.output
+    assert "Skipping foobar/c" in result.output
+    assert result.output.count("Syncing ") == 1
+
+    record = _load_run_record(tmpdir)
+    assert record["state"] == "complete"
+    assert _record_results(tmpdir) == {
+        "a": "success",
+        "b": "success",
+        "c": "success",
+    }
+
+
+def test_sync_run_corrupt_record_aborts_and_preserves_statuses(tmpdir, runner):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    result = runner.invoke(["sync"])
+    assert not result.exception
+
+    status_dir = tmpdir.join("status")
+    items_files = status_dir.visit(
+        lambda p: p.check(file=True) and str(p).endswith(".items")
+    )
+    assert items_files
+    mtimes = {str(p): p.mtime() for p in items_files}
+
+    record_path = _run_record_path(tmpdir)
+    record_path.write("this is not json")
+
+    result = runner.invoke(["sync"])
+    assert result.exception
+    assert "sync run record" in result.output.lower()
+
+    # The corrupt record and all per-collection results are left untouched.
+    assert record_path.read() == "this is not json"
+    for path in items_files:
+        assert path.exists()
+        assert path.mtime() == mtimes[str(path)]
+
+
+def test_sync_run_tampered_plan_aborts(tmpdir, runner):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    result = runner.invoke(["sync"])
+    assert not result.exception
+
+    record_path = _run_record_path(tmpdir)
+    record = json.loads(record_path.read())
+    record["collections"][0]["config_b"]["path"] = "/tampered"
+    record_path.write(json.dumps(record))
+
+    result = runner.invoke(["sync"])
+    assert result.exception
+    assert "fingerprint" in result.output.lower()
+    assert json.loads(record_path.read())["collections"][0]["config_b"]["path"] == (
+        "/tampered"
+    )
+
+
+def test_sync_run_config_mapping_change_starts_fresh(tmpdir, runner, monkeypatch):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    # An interrupted, otherwise successful run.
+    monkeypatch.setattr("vdirsyncer.cli.runrecord.SyncRun.finish", lambda self: None)
+    result = runner.invoke(["sync"])
+    assert not result.exception
+    old_fingerprint = _load_run_record(tmpdir)["fingerprint"]
+    monkeypatch.undo()
+
+    # Pointing side b at a different location changes the storage mapping.
+    bar2 = tmpdir.mkdir("bar2")
+    for name in "abc":
+        bar2.mkdir(name)
+    _write_multi_collection_config(runner, tmpdir, bar_path="bar2")
+
+    result = runner.invoke(["sync"])
+    assert "detected change in config file" in result.output.lower()
+    assert result.exception
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    result = runner.invoke(["sync"])
+    assert not result.exception, result.output
+    # Old plan must not be reused: nothing is skipped, everything syncs again.
+    assert "Skipping " not in result.output
+    assert result.output.count("Syncing ") == 3
+
+    record = _load_run_record(tmpdir)
+    assert record["state"] == "complete"
+    assert record["fingerprint"] != old_fingerprint
+    assert all(entry["result"] == "success" for entry in record["collections"])
+
+
+def test_sync_run_new_target_starts_fresh(tmpdir, runner, monkeypatch):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    monkeypatch.setattr("vdirsyncer.cli.runrecord.SyncRun.finish", lambda self: None)
+    result = runner.invoke(["sync"])
+    assert not result.exception
+    monkeypatch.undo()
+
+    for base in ("foo", "bar"):
+        tmpdir.join(base).mkdir("d")
+    _write_multi_collection_config(runner, tmpdir, collections=("a", "b", "c", "d"))
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    result = runner.invoke(["sync"])
+    assert not result.exception, result.output
+
+    assert "Skipping " not in result.output
+    assert result.output.count("Syncing ") == 4
+    record = _load_run_record(tmpdir)
+    assert record["state"] == "complete"
+    assert {entry["collection"] for entry in record["collections"]} == {
+        "a",
+        "b",
+        "c",
+        "d",
+    }
+
+
+def test_completed_run_starts_fresh_plan(tmpdir, runner):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    result = runner.invoke(["sync"])
+    assert not result.exception
+    assert _load_run_record(tmpdir)["state"] == "complete"
+
+    result = runner.invoke(["sync"])
+    assert not result.exception, result.output
+    assert "Skipping " not in result.output
+    assert result.output.count("Syncing ") == 3
+    assert _load_run_record(tmpdir)["state"] == "complete"
+
+
+def test_failed_collection_sets_exit_status_and_complete_record(
+    tmpdir, runner, monkeypatch
+):
+    _make_collection_dirs(tmpdir, ("foo", "bar"), "abc")
+    _write_multi_collection_config(runner, tmpdir)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+
+    from vdirsyncer.cli import tasks
+    from vdirsyncer.cli.utils import JobFailed
+
+    real_sync_collection = tasks.sync_collection
+
+    async def broken_sync_collection(collection, general, force_delete, *, connector):
+        if collection.name == "b":
+            raise JobFailed("simulated failure")
+        return await real_sync_collection(
+            collection, general, force_delete, connector=connector
+        )
+
+    monkeypatch.setattr(tasks, "sync_collection", broken_sync_collection)
+    result = runner.invoke(["sync"])
+    assert result.exception
+
+    record = _load_run_record(tmpdir)
+    assert record["state"] == "complete"
+    assert _record_results(tmpdir) == {
+        "a": "success",
+        "b": "failed",
+        "c": "success",
+    }
+
+    monkeypatch.undo()
+    result = runner.invoke(["sync"])
+    assert not result.exception, result.output
+    assert _record_results(tmpdir) == {
+        "a": "success",
+        "b": "success",
+        "c": "success",
+    }
+    assert _load_run_record(tmpdir)["state"] == "complete"
+
+
+def test_no_pairs_creates_no_run_record(tmpdir, runner):
+    runner.write_with_general("")
+    result = runner.invoke(["sync"])
+    assert not result.exception
+    assert not _run_record_path(tmpdir).exists()
