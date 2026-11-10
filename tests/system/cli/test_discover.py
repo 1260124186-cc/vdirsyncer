@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 from textwrap import dedent
 
 import pytest
 
 from vdirsyncer import exceptions
 from vdirsyncer.storage.base import Storage
+
+
+def _load_roster(tmpdir, pair="foobar"):
+    path = tmpdir.join("status").join(f"{pair}.collections")
+    return json.loads(path.read())
+
+
+def _roster_entries(tmpdir, pair="foobar"):
+    return {entry["name"]: entry for entry in _load_roster(tmpdir, pair)["collections"]}
 
 
 def test_discover_command(tmpdir, runner):
@@ -285,3 +295,218 @@ def test_showconfig(tmpdir, runner):
             },
         ]
     }
+
+
+def _patch_storage_side_down(monkeypatch, down_path):
+    """Make FilesystemStorage.discover fail for one storage path only."""
+    from vdirsyncer.storage.filesystem import FilesystemStorage
+
+    original = FilesystemStorage.discover
+    down_path = os.path.normpath(down_path)
+
+    async def discover(cls, path, **kwargs):
+        if os.path.normpath(path) == down_path:
+            raise RuntimeError("storage side temporarily unreachable")
+        async for item in original(path=path, **kwargs):
+            yield item
+
+    monkeypatch.setattr(FilesystemStorage, "discover", classmethod(discover))
+
+
+_FILESYSTEM_PAIR = """
+[storage foo]
+type = "filesystem"
+path = "{base}/foo/"
+fileext = ".txt"
+
+[storage bar]
+type = "filesystem"
+path = "{base}/bar/"
+fileext = ".txt"
+
+[pair foobar]
+a = "foo"
+b = "bar"
+"""
+
+
+def test_discover_marks_missing_pending_and_is_idempotent(tmpdir, runner):
+    runner.write_with_general(
+        dedent(
+            _FILESYSTEM_PAIR
+            + """
+collections = ["from a"]
+"""
+        ).format(base=str(tmpdir))
+    )
+
+    for name in "abc":
+        tmpdir.ensure(f"foo/{name}", dir=True)
+        tmpdir.ensure(f"bar/{name}", dir=True)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert set(entries) == {"a", "b", "c"}
+    assert all(entry["state"] == "active" for entry in entries.values())
+
+    # The collection disappears from both healthy sides.
+    tmpdir.join("foo/c").remove()
+    tmpdir.join("bar/c").remove()
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert entries["c"]["state"] == "pending"
+    assert entries["a"]["state"] == "active"
+    assert entries["b"]["state"] == "active"
+    assert "marked pending" in result.output
+
+    # Pending collections are kept on disk but excluded from synchronization.
+    result = runner.invoke(["sync"])
+    assert not result.exception
+    assert "Syncing foobar/c" not in result.output
+    assert "Syncing foobar/a" in result.output
+
+    # Re-running with the same discovery result must not change the roster.
+    roster_file = tmpdir.join("status").join("foobar.collections")
+    before = roster_file.read()
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    assert roster_file.read() == before
+
+    # A reappearing collection is promoted back to active.
+    tmpdir.ensure("foo/c", dir=True)
+    tmpdir.ensure("bar/c", dir=True)
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    assert _roster_entries(tmpdir)["c"]["state"] == "active"
+
+
+def test_discover_keeps_records_when_one_side_is_down(tmpdir, runner, monkeypatch):
+    runner.write_with_general(
+        dedent(
+            _FILESYSTEM_PAIR
+            + """
+collections = ["from a"]
+implicit = "create"
+"""
+        ).format(base=str(tmpdir))
+    )
+
+    for name in "abc":
+        tmpdir.ensure(f"foo/{name}", dir=True)
+        tmpdir.ensure(f"bar/{name}", dir=True)
+
+    assert not runner.invoke(["discover"]).exception
+
+    _patch_storage_side_down(monkeypatch, str(tmpdir.join("bar")))
+
+    # Side a gains a collection; side a (the asserting side) loses another.
+    tmpdir.ensure("foo/d", dir=True)
+    tmpdir.join("foo/c").remove()
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    assert "keeping its previously known collections" in result.output
+
+    entries = _roster_entries(tmpdir)
+    assert entries["a"]["state"] == "active"
+    assert entries["b"]["state"] == "active"
+    # A newly discovered collection is added even though the other side is down.
+    assert entries["d"]["state"] == "active"
+    assert entries["d"]["b"]["collection"] == "d"
+    # The healthy asserting side can still confirm a disappearance.
+    assert entries["c"]["state"] == "pending"
+
+    monkeypatch.undo()
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert entries["d"]["state"] == "active"
+    assert entries["c"]["state"] == "pending"
+
+
+def test_discover_manual_mapping_is_pinned(tmpdir, runner, monkeypatch):
+    runner.write_with_general(
+        dedent(
+            _FILESYSTEM_PAIR
+            + """
+collections = [["manual", "ma", "mb"], "plain"]
+implicit = "create"
+"""
+        ).format(base=str(tmpdir))
+    )
+
+    tmpdir.ensure("foo/ma", dir=True)
+    tmpdir.ensure("bar/mb", dir=True)
+    tmpdir.ensure("foo/plain", dir=True)
+    tmpdir.ensure("bar/plain", dir=True)
+
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert entries["manual"]["origin"] == "manual"
+    assert entries["manual"]["state"] == "active"
+    manual_before = entries["manual"]
+
+    # Side b becomes unreachable and its manual collection even vanishes:
+    # the manual mapping must survive completely untouched.
+    _patch_storage_side_down(monkeypatch, str(tmpdir.join("bar")))
+    tmpdir.join("bar/mb").remove()
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert entries["manual"] == manual_before
+    assert entries["manual"]["state"] == "active"
+    assert entries["plain"]["state"] == "active"
+
+    # After recovery the mapping is still a pinned, active manual entry.
+    monkeypatch.undo()
+    result = runner.invoke(["discover"])
+    assert not result.exception
+    entries = _roster_entries(tmpdir)
+    assert entries["manual"]["origin"] == "manual"
+    assert entries["manual"]["state"] == "active"
+
+
+def test_failed_discovery_does_not_leave_partial_roster(tmpdir, runner):
+    runner.write_with_general(
+        dedent(
+            _FILESYSTEM_PAIR
+            + """
+collections = ["from a"]
+"""
+        ).format(base=str(tmpdir))
+    )
+
+    for name in "abc":
+        tmpdir.ensure(f"foo/{name}", dir=True)
+        tmpdir.ensure(f"bar/{name}", dir=True)
+
+    assert not runner.invoke(["discover"]).exception
+
+    status_dir = tmpdir.join("status")
+    roster_file = status_dir.join("foobar.collections")
+    before = roster_file.read()
+
+    # Add a non-existent explicit collection and refuse to create it, which
+    # aborts discovery before the roster is persisted.
+    config = runner.cfg.read().replace(
+        'collections = ["from a"]', 'collections = ["from a", "ghost"]'
+    )
+    runner.cfg.write(config)
+
+    result = runner.invoke(["discover"], input="n\n")
+    assert result.exception
+
+    # The previous roster is byte-identical, with no partial state or temp files.
+    assert roster_file.read() == before
+    roster = json.loads(roster_file.read())
+    assert [entry["name"] for entry in roster["collections"]] == ["a", "b", "c"]
+    leftovers = [
+        entry.basename
+        for entry in status_dir.listdir()
+        if entry.basename != "foobar.collections"
+    ]
+    assert leftovers == []
