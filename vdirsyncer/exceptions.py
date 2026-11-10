@@ -67,6 +67,29 @@ class WrongEtagError(PreconditionFailed):
     """Wrong etag"""
 
 
+class PendingChangesError(Error):
+    """Persisted pending changes can't be replayed safely.
+
+    Raised by storages that keep a journal of changes which couldn't be
+    committed because the underlying file was modified externally, when that
+    journal is corrupt (broken hash chain or checksum), when its records
+    disagree about the outcome for a single item, or when a recorded change
+    can't be applied to the current file anymore.
+
+    The storage file and the journal are always left untouched so that the
+    user can investigate and repair the records manually.
+    """
+
+    path = None
+    problems = None
+
+    def __str__(self):
+        msg = Error.__str__(self)
+        for problem in self.problems or ():
+            msg += f"\n  - {problem}"
+        return msg
+
+
 class ReadOnlyError(Error):
     """Storage is read-only."""
 
