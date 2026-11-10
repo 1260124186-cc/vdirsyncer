@@ -9,6 +9,22 @@ Package maintainers and users who have to manually update their installation
 may want to subscribe to `GitHub's tag feed
 <https://github.com/pimutils/vdirsyncer/tags.atom>`_.
 
+Version 0.21.2
+==============
+
+- Sync actions (uploads, updates and deletes) are now written to a
+  recoverable action journal before they touch the remote storage. If a sync
+  is interrupted (e.g. by the machine sleeping or the process being killed),
+  the next run reconciles the journal against the actual storage state:
+  actions that already took effect only have their sync status repaired and
+  are never written a second time, while actions that did not reach the
+  storage are retried.
+- A corrupted journal, or an item ident whose remote state cannot be matched
+  to a journaled action (e.g. a different item with the same UID), now aborts
+  the sync with an explicit error instead of modifying or deleting any data.
+  Items that are not synchronized, including items added manually, are never
+  removed during recovery.
+
 Version 0.21.1
 ==============
 

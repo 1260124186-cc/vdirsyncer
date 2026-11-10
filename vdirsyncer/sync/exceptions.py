@@ -80,3 +80,44 @@ class IdentAlreadyExists(SyncError):
 
     def to_ident_conflict(self, storage):
         return IdentConflict(storage=storage, hrefs=[self.old_href, self.new_href])
+
+
+class JournalError(SyncError):
+    """Baseclass for errors related to the recoverable action journal."""
+
+
+class JournalCorrupted(JournalError):
+    """
+    The action journal (the write-ahead log of pending synchronization
+    actions) is corrupted or unreadable and cannot be interpreted safely.
+
+    The synchronization is aborted before any storage is written to, no data
+    is deleted.
+
+    :param path: The path of the corrupted journal file, if any.
+    :param reason: Human-readable description of the corruption.
+    """
+
+    path = None
+    reason = None
+
+
+class AmbiguousRemoteResult(JournalError):
+    """
+    A journaled action for an item ident cannot be mapped to a single outcome
+    on the remote storage, for example because the remote now contains an item
+    with the same UID but different content.
+
+    The synchronization is aborted before any further storage is written to.
+    Existing data, including items that were added manually, is never modified
+    or deleted.
+
+    :param ident: The ident (usually the UID) of the affected item.
+    :param side: The storage side (``"a"`` or ``"b"``) on which the ambiguity
+        was detected.
+    :param reason: Human-readable description of what could not be decided.
+    """
+
+    ident = None
+    side = None
+    reason = None

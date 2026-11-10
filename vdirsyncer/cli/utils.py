@@ -15,7 +15,9 @@ from vdirsyncer import BUGTRACKER_HOME
 from vdirsyncer import DOCS_HOME
 from vdirsyncer import exceptions
 from vdirsyncer.storage.base import Storage
+from vdirsyncer.sync.exceptions import AmbiguousRemoteResult
 from vdirsyncer.sync.exceptions import IdentConflict
+from vdirsyncer.sync.exceptions import JournalCorrupted
 from vdirsyncer.sync.exceptions import PartialSync
 from vdirsyncer.sync.exceptions import StorageEmpty
 from vdirsyncer.sync.exceptions import SyncConflict
@@ -115,6 +117,21 @@ def handle_cli_error(status_name=None, exc=None):
                 storage=e.storage,
                 href_list="\n".join(map(repr, e.hrefs)),
             )
+        )
+    except JournalCorrupted as e:
+        cli_logger.error(
+            f"{status_name}: The recoverable action journal "
+            f"({e.path or 'in-memory'}) is corrupted: {e.reason}. The "
+            "synchronization was aborted without modifying or deleting any "
+            "data. Verify the contents of both storages, then inspect or "
+            "remove the journal file and retry."
+        )
+    except AmbiguousRemoteResult as e:
+        cli_logger.error(
+            f"{status_name}: The journaled action for item {e.ident!r} on "
+            f"storage side {e.side!r} cannot be recovered safely: {e.reason}. "
+            "The synchronization was aborted without modifying or deleting "
+            "any data. Resolve the item manually and retry."
         )
     except (click.Abort, KeyboardInterrupt, JobFailed):
         pass

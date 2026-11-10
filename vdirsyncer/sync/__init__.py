@@ -21,11 +21,16 @@ from vdirsyncer.storage.base import Storage
 from vdirsyncer.utils import uniq
 from vdirsyncer.vobject import Item
 
+from .exceptions import AmbiguousRemoteResult
 from .exceptions import BothReadOnly
 from .exceptions import IdentAlreadyExists
 from .exceptions import PartialSync
 from .exceptions import StorageEmpty
 from .exceptions import SyncConflict
+from .journal import ACTION_DELETE
+from .journal import ACTION_UPDATE
+from .journal import ACTION_UPLOAD
+from .journal import ActionJournal
 from .status import ItemMetadata
 from .status import SqliteStatus
 from .status import SubStatus
@@ -145,6 +150,7 @@ async def sync(
             return b
 
     status_nonempty = bool(next(status.iter_old(), None))
+    journal = status.get_journal()
 
     with status.transaction():
         a_info = _StorageInfo(storage_a, SubStatus(status, "a"))
@@ -159,24 +165,35 @@ async def sync(
             elif not a_nonempty and b_nonempty:
                 raise StorageEmpty(empty_storage=storage_a)
 
+        # Recover actions left behind by an interrupted run before anything is
+        # written to the storages. Raises on undecidable situations.
+        if journal.has_entries():
+            reconcile_journal(journal, a_info, b_info)
+
         actions = list(_get_actions(a_info, b_info))
 
         async with storage_a.at_once(), storage_b.at_once():
             for action in actions:
                 try:
-                    await action.run(a_info, b_info, conflict_resolution, partial_sync)
+                    await action.run(
+                        a_info, b_info, conflict_resolution, partial_sync, journal
+                    )
                 except Exception as e:
                     if error_callback:
                         error_callback(e)
                     else:
                         raise
 
+    # The status transaction committed successfully. Pending records are only
+    # kept when storage errors were swallowed by `error_callback`.
+    journal.finalize()
+
 
 class Action:
-    async def _run_impl(self, a, b):  # pragma: no cover
+    async def _run_impl(self, a, b, journal):  # pragma: no cover
         raise NotImplementedError
 
-    async def run(self, a, b, conflict_resolution, partial_sync):
+    async def run(self, a, b, conflict_resolution, partial_sync, journal):
         with self.auto_rollback(a, b):
             if self.dest.storage.read_only:
                 if partial_sync == "error":
@@ -187,7 +204,14 @@ class Action:
                 else:
                     assert partial_sync == "revert"
 
-            await self._run_impl(a, b)
+            await self._run_impl(a, b, journal)
+
+    @staticmethod
+    def _side_of(dest, a, b) -> str:
+        if dest is a:
+            return "a"
+        assert dest is b
+        return "b"
 
     @contextlib.contextmanager
     def auto_rollback(self, a, b):
@@ -207,15 +231,25 @@ class Upload(Action):
         self.ident = item.ident
         self.dest = dest
 
-    async def _run_impl(self, a, b):
+    async def _run_impl(self, a, b, journal):
         if self.dest.storage.read_only:
             href = etag = None
         else:
             sync_logger.info(
                 f"Copying (uploading) item {self.ident} to {self.dest.storage}"
             )
+            side = self._side_of(self.dest, a, b)
+            seq = journal.before_write(
+                ident=self.ident,
+                action=ACTION_UPLOAD,
+                side=side,
+                item_hash=self.item.hash,
+                href=None,
+                etag=None,
+            )
             href, etag = await self.dest.storage.upload(self.item)
             assert href is not None
+            journal.mark_done(seq, href, etag)
 
         self.dest.status.insert_ident(
             self.ident, ItemMetadata(href=href, hash=self.item.hash, etag=etag)
@@ -228,15 +262,26 @@ class Update(Action):
         self.ident = item.ident
         self.dest = dest
 
-    async def _run_impl(self, a, b):
+    async def _run_impl(self, a, b, journal):
         if self.dest.storage.read_only:
             meta = ItemMetadata(hash=self.item.hash)
         else:
             sync_logger.info(
                 f"Copying (updating) item {self.ident} to {self.dest.storage}"
             )
+            side = self._side_of(self.dest, a, b)
             meta = self.dest.status.get_new(self.ident)
-            meta.etag = await self.dest.storage.update(meta.href, self.item, meta.etag)
+            seq = journal.before_write(
+                ident=self.ident,
+                action=ACTION_UPDATE,
+                side=side,
+                item_hash=self.item.hash,
+                href=meta.href,
+                etag=meta.etag,
+            )
+            new_etag = await self.dest.storage.update(meta.href, self.item, meta.etag)
+            journal.mark_done(seq, meta.href, new_etag)
+            meta.etag = new_etag
 
         self.dest.status.update_ident(self.ident, meta)
 
@@ -246,7 +291,7 @@ class Delete(Action):
         self.ident = ident
         self.dest = dest
 
-    async def _run_impl(self, a, b):
+    async def _run_impl(self, a, b, journal):
         meta = self.dest.status.get_new(self.ident)
         if self.dest.storage.read_only or self.dest.storage.no_delete:
             sync_logger.debug(
@@ -254,7 +299,17 @@ class Delete(Action):
             )
         else:
             sync_logger.info(f"Deleting item {self.ident} from {self.dest.storage}")
+            side = self._side_of(self.dest, a, b)
+            seq = journal.before_write(
+                ident=self.ident,
+                action=ACTION_DELETE,
+                side=side,
+                item_hash=None,
+                href=meta.href,
+                etag=meta.etag,
+            )
             await self.dest.storage.delete(meta.href, meta.etag)
+            journal.mark_done(seq, meta.href, meta.etag)
 
         self.dest.status.remove_ident(self.ident)
 
@@ -263,7 +318,7 @@ class ResolveConflict(Action):
     def __init__(self, ident):
         self.ident = ident
 
-    async def run(self, a, b, conflict_resolution, partial_sync):
+    async def run(self, a, b, conflict_resolution, partial_sync, journal):
         with self.auto_rollback(a, b):
             sync_logger.info(f"Doing conflict resolution for item {self.ident}...")
 
@@ -286,6 +341,7 @@ class ResolveConflict(Action):
                         b,
                         conflict_resolution,
                         partial_sync,
+                        journal,
                     )
                 if new_item.hash != meta_b.hash:
                     await Update(new_item, b).run(
@@ -293,6 +349,7 @@ class ResolveConflict(Action):
                         b,
                         conflict_resolution,
                         partial_sync,
+                        journal,
                     )
             else:
                 raise UserError(
@@ -338,3 +395,115 @@ def _get_actions(a_info: _StorageInfo, b_info: _StorageInfo):
             else:
                 # was deleted from a and not changed on b
                 yield Delete(ident, b_info)
+
+
+def reconcile_journal(
+    journal: ActionJournal, a_info: _StorageInfo, b_info: _StorageInfo
+) -> None:
+    """Reconcile journal records left behind by an interrupted run.
+
+    Called after both storages were listed (so the "new" status reflects the
+    actual remote state) and before any storage is written to. Every record is
+    classified as confirmed (only the sync status is patched), still pending
+    (left for the freshly computed action plan to retry) or safely abandoned.
+    Anything that cannot be decided aborts the run with
+    :class:`AmbiguousRemoteResult`; no data is ever deleted here.
+    """
+    infos = {"a": a_info, "b": b_info}
+    sync_logger.info("Recovering interrupted sync from action journal")
+
+    for entry in journal.iter_live():
+        info = infos[entry.side]
+        # The item currently visible on the target storage, if any.
+        remote = info.status.get_new(entry.ident)
+
+        if entry.action == ACTION_UPLOAD:
+            _reconcile_upload(journal, entry, info, remote)
+        elif entry.action == ACTION_UPDATE:
+            _reconcile_update(journal, entry, info, remote)
+        else:
+            _reconcile_delete(journal, entry, remote)
+
+
+def _reconcile_upload(journal, entry, info, remote) -> None:
+    if remote is None:
+        # The item never reached the storage, or was removed again afterwards.
+        # In both cases there is nothing to deduplicate; retry the upload.
+        if entry.state == "done":
+            journal.reset_to_pending(
+                entry.seq, "marked done, but item is absent from storage"
+            )
+        return
+
+    if remote.hash != entry.item_hash:
+        raise AmbiguousRemoteResult(
+            ident=entry.ident,
+            side=entry.side,
+            reason=(
+                "an item with the same ident already exists on the target "
+                "storage, but its content does not match the journaled upload"
+            ),
+        )
+
+    # The upload is confirmed remotely (the href may differ if the storage
+    # moved it). Only patch the status, never write again.
+    info.status.reconcile_ident(entry.ident, remote)
+    if entry.state != "done":
+        journal.mark_done(entry.seq, remote.href, remote.etag)
+
+
+def _reconcile_update(journal, entry, info, remote) -> None:
+    if remote is None:
+        # The target item is gone, so this update can never apply. It is safe
+        # to abandon; the freshly computed action plan decides what to do.
+        journal.mark_abandoned(entry.seq, "target item no longer exists")
+        return
+
+    if remote.hash == entry.item_hash:
+        # The intended content is already on the storage (href/etag may have
+        # moved or changed on the server side).
+        info.status.reconcile_ident(entry.ident, remote)
+        if entry.state != "done":
+            journal.mark_done(entry.seq, remote.href, remote.etag)
+        return
+
+    if remote.href == entry.href and remote.etag == entry.etag:
+        # The preconditions are untouched: the update simply never ran. The
+        # action plan will re-execute it.
+        if entry.state == "done":
+            journal.reset_to_pending(
+                entry.seq, "marked done, but target content was not updated"
+            )
+        return
+
+    raise AmbiguousRemoteResult(
+        ident=entry.ident,
+        side=entry.side,
+        reason=(
+            "the target item changed independently since the journaled "
+            "update; it is unclear whether the update already took effect"
+        ),
+    )
+
+
+def _reconcile_delete(journal, entry, remote) -> None:
+    if remote is None:
+        # Nothing is left to delete (the delete succeeded or the item was
+        # removed otherwise).
+        if entry.state != "done":
+            journal.mark_done(entry.seq, entry.href, entry.etag)
+        return
+
+    if remote.href == entry.href and remote.etag == entry.etag:
+        # The item is exactly as expected: the delete never ran. The action
+        # plan will re-execute it.
+        if entry.state == "done":
+            journal.reset_to_pending(entry.seq, "marked done, but item still exists")
+        return
+
+    # The item changed or moved. Deleting it would destroy unfamiliar data,
+    # so the stale journaled delete is abandoned and the plan re-evaluates.
+    journal.mark_abandoned(
+        entry.seq,
+        "target item changed or moved since the journaled delete",
+    )

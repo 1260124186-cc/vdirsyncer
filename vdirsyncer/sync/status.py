@@ -6,6 +6,7 @@ import sqlite3
 import sys
 
 from .exceptions import IdentAlreadyExists
+from .journal import ActionJournal
 
 
 @contextlib.contextmanager
@@ -116,7 +117,25 @@ class SqliteStatus(_StatusBase):
         self._c = sqlite3.connect(path)
         self._c.isolation_level = None  # turn off idiocy of DB-API
         self._c.row_factory = sqlite3.Row
+        self._journal = None
         self._update_schema()
+
+    @property
+    def journal_path(self) -> str:
+        """Location of the recoverable action journal.
+
+        The journal is a separate database so its commits are not affected by
+        the status transaction's rollback.
+        """
+        if self._path == ":memory:":
+            return ":memory:"
+        return self._path + ".journal"
+
+    def get_journal(self) -> ActionJournal:
+        """Open (or reuse) the action journal for this status database."""
+        if self._journal is None or self._journal.closed:
+            self._journal = ActionJournal(self.journal_path)
+        return self._journal
 
     def _update_schema(self):
         if self._is_latest_version():
@@ -170,6 +189,8 @@ class SqliteStatus(_StatusBase):
             )
 
     def close(self):
+        if self._journal is not None and not self._journal.closed:
+            self._journal.close()
         if self._c:
             self._c.close()
             self._c = None
@@ -309,6 +330,49 @@ class SqliteStatus(_StatusBase):
             (ident, a.href, b.href, a.hash, b.hash, a.etag, b.etag),
         )
 
+    def reconcile_ident_a(self, ident, props):
+        self._reconcile_ident(ident, "a", props)
+
+    def reconcile_ident_b(self, ident, props):
+        self._reconcile_ident(ident, "b", props)
+
+    def _reconcile_ident(self, ident, side, props):
+        """Make both the committed and the in-progress status believe the
+        item's metadata on one side equals what is actually on the storage.
+
+        This is used during journal recovery when a write already reached the
+        storage: the sync planner then treats the item as unchanged and does
+        not write it a second time.
+        """
+        assert side in "ab"
+
+        updated = self._c.execute(
+            f"UPDATE new_status SET href_{side}=?, hash_{side}=?, etag_{side}=? "
+            "WHERE ident=?",
+            (props.href, props.hash, props.etag, ident),
+        ).rowcount
+        assert updated > 0
+
+        # Rebuild the committed ("old") row from the current remote truth,
+        # keeping the other side's observed metadata, so change detection sees
+        # no difference. The row is replaced wholesale at commit anyway.
+        fresh = self._c.execute(
+            "SELECT * FROM new_status WHERE ident=?", (ident,)
+        ).fetchone()
+        assert fresh is not None
+        self._c.execute(
+            "INSERT OR REPLACE INTO status VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ident,
+                fresh["href_a"],
+                fresh["href_b"],
+                fresh["hash_a"],
+                fresh["hash_b"],
+                fresh["etag_a"],
+                fresh["etag_b"],
+            ),
+        )
+
     def _get_by_href_impl(self, href, default=(None, None), side=None):
         res = self._c.execute(
             f"SELECT ident, hash_{side} AS hash, etag_{side} AS etag "
@@ -345,12 +409,14 @@ class SubStatus:
             self.get = parent.get_a
             self.get_new = parent.get_new_a
             self.get_by_href = parent.get_by_href_a
+            self.reconcile_ident = parent.reconcile_ident_a
         else:
             self.insert_ident = parent.insert_ident_b
             self.update_ident = parent.update_ident_b
             self.get = parent.get_b
             self.get_new = parent.get_new_b
             self.get_by_href = parent.get_by_href_b
+            self.reconcile_ident = parent.reconcile_ident_b
 
 
 class ItemMetadata:
